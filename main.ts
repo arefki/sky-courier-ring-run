@@ -15,10 +15,42 @@
 import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildDossier } from './vendor/makefun-game.ts';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { buildDossier, canonicalJson } from './vendor/makefun-game.ts';
+
+// Notes I compute from the files being handed in, so the dossier the judge
+// reads carries facts about this game instead of only the kit's generic block.
+function listFiles(root: string, prefix = ''): { path: string; bytes: number }[] {
+  const found: { path: string; bytes: number }[] = [];
+  for (const entry of readdirSync(join(root, prefix), { withFileTypes: true })) {
+    const rel = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+    if (entry.isDirectory()) found.push(...listFiles(root, rel));
+    else if (entry.isFile()) found.push({ path: rel, bytes: statSync(join(root, rel)).size });
+  }
+  return found.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+}
+
+function textAfter(haystack: string, pattern: RegExp): string | null {
+  const hit = haystack.match(pattern);
+  return hit === null || hit[1] === undefined ? null : hit[1];
+}
 
 const here = fileURLToPath(new URL('.', import.meta.url));
 const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+
+// Fail fast, with a plain reason, when the hand-in is incomplete: the game
+// folder must hold the entry page and its script, and screenshots/ must hold
+// at least one PNG or JPEG render (the first by name is the cover).
+const gameDir = join(here, 'game');
+const shotsDir = join(here, 'screenshots');
+if (!existsSync(gameDir)) throw new Error('main.ts: game/ is missing beside main.ts: the entry hands in the game it built');
+const gameFiles = listFiles(gameDir);
+if (gameFiles.length === 0) throw new Error('main.ts: game/ holds no files: nothing to hand in');
+if (!gameFiles.some((f) => f.path === 'index.html')) throw new Error('main.ts: game/index.html is missing: a desktop browser needs the entry page');
+if (!gameFiles.some((f) => f.path === 'game.js')) throw new Error('main.ts: game/game.js is missing: the entry page loads its game script from there');
+if (!existsSync(shotsDir)) throw new Error('main.ts: screenshots/ is missing beside main.ts: an entry hands in 3 or 4 renders of its game');
+const shotFiles = listFiles(shotsDir).filter((f) => /\.(png|jpe?g)$/i.test(f.path));
+if (shotFiles.length === 0) throw new Error('main.ts: screenshots/ holds no PNG or JPEG render: the first by name is the cover');
 
 mkdirSync(out, { recursive: true });
 cpSync(join(here, 'game'), join(out, 'game'), { recursive: true });
@@ -39,3 +71,27 @@ writeFileSync(
     game_path_max_bytes: 1000,
   }),
 );
+
+// Enrich the dossier with facts read off the real files: the title from
+// game/index.html, the ring count from game/game.js, and both file lists
+// with sizes, so the summary describes this game and not just the kit.
+const dossierPath = join(out, 'dossier.json');
+const dossier = JSON.parse(readFileSync(dossierPath, 'utf8')) as { text: string };
+const indexHtml = readFileSync(join(gameDir, 'index.html'), 'utf8');
+const gameJs = readFileSync(join(gameDir, 'game.js'), 'utf8');
+const title = textAfter(indexHtml, /<title>([^<]*)<\/title>/i) ?? 'unknown';
+const rings = textAfter(gameJs, /const RING_COUNT = (\d+);/);
+const gameBytes = gameFiles.reduce((sum, f) => sum + f.bytes, 0);
+const shotBytes = shotFiles.reduce((sum, f) => sum + f.bytes, 0);
+const notes = [
+  '',
+  '## Hand-in notes',
+  '',
+  `- Title: ${title}`,
+  `- Rings on the course: ${rings ?? 'unknown'}`,
+  `- Game files (${gameFiles.length}, ${gameBytes} bytes): ${gameFiles.map((f) => `${f.path} (${f.bytes} B)`).join(', ')}`,
+  `- Screenshots (${shotFiles.length}, ${shotBytes} bytes): ${shotFiles.map((f) => `${f.path} (${f.bytes} B)`).join(', ')}`,
+  '',
+].join('\n');
+dossier.text = `${dossier.text.replace(/\n+$/, '\n')}${notes}`;
+writeFileSync(dossierPath, canonicalJson(dossier));
